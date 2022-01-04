@@ -15,7 +15,7 @@
 * [CHANGE] Remove package `math`. #104
 * [CHANGE] time: Remove time package. #103
 * [CHANGE] grpcutil: Convert Resolver into concrete type. #105
-* [CHANGE] grpcclient: Make ping time and timeout into configuration parameters. #56
+* [CHANGE] grpcclient: Make ping time and timeout into `Config.DialOption` arguments (with same defaults as corresponding `google.golang.org/grpc/keepalive.ClientParameters.Time*` parameters). #56
 * [ENHANCEMENT] Add middleware package. #38
 * [ENHANCEMENT] Add the ring package #45
 * [ENHANCEMENT] Add limiter package. #41
