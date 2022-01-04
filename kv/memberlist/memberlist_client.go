@@ -1,14 +1,16 @@
 package memberlist
 
 import (
-	"bytes"
+	bytes "bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
-	"math"
+	"io"
+	math "math"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +29,7 @@ import (
 const (
 	maxCasRetries              = 10          // max retries in CAS operation
 	noChangeDetectedRetrySleep = time.Second // how long to sleep after no change was detected in CAS
+	notifyMsgQueueSize         = 1024        // size of workers channel that handles memberlist messages
 )
 
 // Client implements kv.Client interface, by using memberlist.KV
@@ -251,6 +254,11 @@ type KV struct {
 	receivedMessagesSize int
 	messageCounter       int // Used to give each message in the sentMessages and receivedMessages a unique ID, for UI.
 
+	// Worker synchronization fields.
+	notifyCh        chan *bytes.Buffer
+	notifyWorkersWG sync.WaitGroup
+	notifyBuffPool  sync.Pool // Used to copy passed message in NotifyMsg method.
+
 	// closed on shutdown
 	shutdown chan struct{}
 
@@ -347,8 +355,14 @@ func NewKV(cfg KVConfig, logger log.Logger, dnsProvider DNSProvider, registerer 
 		codecs:         make(map[string]codec.Codec),
 		watchers:       make(map[string][]chan string),
 		prefixWatchers: make(map[string][]chan string),
-		shutdown:       make(chan struct{}),
-		maxCasRetries:  maxCasRetries,
+		notifyCh:       make(chan *bytes.Buffer, notifyMsgQueueSize),
+		notifyBuffPool: sync.Pool{
+			New: func() interface{} {
+				return &bytes.Buffer{}
+			},
+		},
+		shutdown:      make(chan struct{}),
+		maxCasRetries: maxCasRetries,
 	}
 
 	mlkv.createAndRegisterMetrics()
@@ -428,7 +442,12 @@ func (m *KV) starting(_ context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to create memberlist: %v", err)
 	}
-
+	// Spawn notify workers.
+	numNotifyWorkers := runtime.NumCPU()
+	for i := 0; i < numNotifyWorkers; i++ {
+		m.notifyWorkersWG.Add(1)
+		go m.processNotifyMsg()
+	}
 	// Finish delegate initialization.
 	m.memberlist = list
 	m.broadcasts = &memberlist.TransmitLimitedQueue{
@@ -600,6 +619,7 @@ func (m *KV) stopping(_ error) error {
 	}
 
 	close(m.shutdown)
+	m.notifyWorkersWG.Wait() // wait for workers completion
 
 	err = m.memberlist.Shutdown()
 	if err != nil {
@@ -932,6 +952,38 @@ func (m *KV) NodeMeta(limit int) []byte {
 func (m *KV) NotifyMsg(msg []byte) {
 	m.initWG.Wait()
 
+	// the passed message must be copied, since it may be altered after the call returns.
+	// https://github.com/hashicorp/memberlist/blob/master/delegate.go#L14-L15
+	msgBuff := m.notifyBuffPool.Get().(*bytes.Buffer)
+	io.Copy(msgBuff, bytes.NewReader(msg))
+
+	select {
+	case m.notifyCh <- msgBuff:
+	default:
+		level.Warn(m.logger).Log("msg", "notify queue full, dropping message", "queue_size", notifyMsgQueueSize)
+	}
+}
+
+func (m *KV) processNotifyMsg() {
+	defer m.notifyWorkersWG.Done()
+
+	for {
+		select {
+		case msgBuff := <-m.notifyCh:
+			m.notifyMsg(msgBuff.Bytes())
+
+			// put buffer back into the pool
+			msgBuff.Reset()
+			m.notifyBuffPool.Put(msgBuff)
+
+		case <-m.shutdown:
+			// stop worker on shutdown
+			return
+		}
+	}
+}
+
+func (m *KV) notifyMsg(msg []byte) {
 	m.numberOfReceivedMessages.Inc()
 	m.totalSizeOfReceivedMessages.Add(float64(len(msg)))
 
